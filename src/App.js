@@ -773,8 +773,27 @@ export default function App() {
             return;
         }
 
-        const snapshot = getCurrentSnapshot();
-        setTransformedPreview(snapshot);
+        // 1. Take current (previous-image) annotations
+        const rawPrevAnn = getCurrentSnapshot();
+
+        // 2. Apply carry-over transform HERE, manually
+        const alignedAnn = {
+            outer: {
+                points: transformPointsBetweenImages(rawPrevAnn.outer.points, prevImage, image),
+                edges: rawPrevAnn.outer.edges
+            },
+            inner: {
+                points: transformPointsBetweenImages(rawPrevAnn.inner.points, prevImage, image),
+                edges: rawPrevAnn.inner.edges
+            },
+            floor: {
+                points: transformPointsBetweenImages(rawPrevAnn.floor.points, prevImage, image),
+                edges: rawPrevAnn.floor.edges
+            }
+        };
+
+        // 3. Save *correct* preview
+        setTransformedPreview(alignedAnn);
         setLoadingJson(true);
         setJsonError(null);
 
@@ -802,7 +821,7 @@ export default function App() {
                 setChoicePending(true);
                 setPreviewedImage(currentImageName);
             });
-    }, [image, loadMode, currentImageName]);
+    }, [image, loadMode, currentImageName, prevImage]);
 
     const handleChooseTransformed = () => {
         pushHistory();
