@@ -11,13 +11,14 @@ const Button = ({children, onClick, inactive = false, color = 'blue'}) => {
         green: '#28a745',
         red: '#dc3545',
         orange: '#fd7e14',
-        gray: '#999'
+        gray: '#999',
     };
     const bgColor = inactive ? '#999' : (colors[color] || colors.blue);
 
     return (
         <button
-            onClick={onClick}
+            onClick={inactive ? undefined : onClick}
+            disabled={inactive}
             style={{
                 padding: '8px 12px',
                 marginRight: 8,
@@ -47,7 +48,7 @@ export default function App() {
     const [stageScale, setStageScale] = useState(1);
     const [stageDimensions, setStageDimensions] = useState({width: 0, height: 0});
 
-    // --- Separate annotations for outer wall, inner wall, and floor ---
+    // --- Annotations ---
     const [outerWallPoints, setOuterWallPoints] = useState([]);
     const [outerWallEdges, setOuterWallEdges] = useState([]);
     const [innerWallPoints, setInnerWallPoints] = useState([]);
@@ -56,20 +57,48 @@ export default function App() {
     const [floorEdges, setFloorEdges] = useState([]);
     const [hoverTarget, setHoverTarget] = useState(null);
 
-    const [annotationMode, setAnnotationMode] = useState('outer'); // 'outer', 'inner', or 'floor'
-    const [historyVersion, setHistoryVersion] = useState(0); // to trigger re-render when needed
-    const historyRef = useRef([]); // stable reference that never resets automatically
-    const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false);
+    const [annotationMode, setAnnotationMode] = useState('outer');
+    const historyRef = useRef([]);
     const [hasExported, setHasExported] = useState(false);
     const stageRef = useRef(null);
+
+    // --- Load Mode / Dual Preview ---
+    const [loadMode, setLoadMode] = useState(false);
+    const [choicePending, setChoicePending] = useState(false);
+    const [transformedPreview, setTransformedPreview] = useState(null);
+    const [loadedPreview, setLoadedPreview] = useState(null);
+    const [previewedImage, setPreviewedImage] = useState(null);
+    const [loadingJson, setLoadingJson] = useState(false);
+    const [jsonError, setJsonError] = useState(null);
 
     // --- Load current image ---
     const currentImageName = imageList[currentIndex];
     const imageURL = currentImageName
         ? `http://localhost:3001/images/${currentImageName}`
         : null;
-    console.log("Loading image:", imageURL);
-    const [image] = useImage(imageURL, 'anonymous');  // ✅ enable cross-origin image loading
+    const [image] = useImage(imageURL, 'anonymous');
+
+    const emptyAnn = {
+        outer: {points: [], edges: []},
+        inner: {points: [], edges: []},
+        floor: {points: [], edges: []},
+    };
+
+    const getCurrentSnapshot = () => ({
+        outer: {points: [...outerWallPoints], edges: [...outerWallEdges]},
+        inner: {points: [...innerWallPoints], edges: [...innerWallEdges]},
+        floor: {points: [...floorPoints], edges: [...floorEdges]},
+    });
+
+    const applySnapshot = (snap) => {
+        const s = snap || emptyAnn;
+        setOuterWallPoints(s.outer.points || []);
+        setOuterWallEdges(s.outer.edges || []);
+        setInnerWallPoints(s.inner.points || []);
+        setInnerWallEdges(s.inner.edges || []);
+        setFloorPoints(s.floor.points || []);
+        setFloorEdges(s.floor.edges || []);
+    };
 
     const pushHistory = () => {
         if (!image) return;
@@ -81,10 +110,9 @@ export default function App() {
             floorPoints: [...floorPoints],
             floorEdges: [...floorEdges],
         });
-        setHistoryVersion(v => v + 1); // force update to refresh Ctrl+Z listener
-        const MAX_HISTORY = 200; // or whatever you prefer
+        const MAX_HISTORY = 200;
         if (historyRef.current.length > MAX_HISTORY) {
-            historyRef.current.shift(); // remove oldest
+            historyRef.current.shift();
         }
     };
 
@@ -92,7 +120,6 @@ export default function App() {
         const stage = e.target.getStage();
         let mousePos = stage.getPointerPosition();
 
-        // Convert from scaled Stage coordinates to original image coordinates
         if (mousePos && stageScale !== 1) {
             mousePos = {
                 x: mousePos.x / stageScale,
@@ -100,7 +127,7 @@ export default function App() {
             };
         }
 
-        const hoverDist = 8 / (stageScale || 1); // Adjust hover distance for scale
+        const hoverDist = 8 / (stageScale || 1);
         let nearest = null;
         let minDist = Infinity;
 
@@ -110,7 +137,7 @@ export default function App() {
             {mode: 'floor', points: floorPoints, edges: floorEdges}
         ];
 
-        // Check points first
+        // Points
         for (const set of allSets) {
             set.points.forEach((pt, idx) => {
                 const d = distance(mousePos, pt);
@@ -121,7 +148,7 @@ export default function App() {
             });
         }
 
-        // Check edges
+        // Edges
         for (const set of allSets) {
             set.edges.forEach(([i1, i2], idx) => {
                 const a = set.points[i1];
@@ -144,7 +171,7 @@ export default function App() {
         setHoverTarget(nearest);
     };
 
-// --- Geometry helpers ---
+    // --- Geometry helpers ---
     function distance(p1, p2) {
         return Math.sqrt((p1.x - p2.x) ** 2 + (p1.y - p2.y) ** 2);
     }
@@ -163,28 +190,23 @@ export default function App() {
         return mat;
     }
 
-    function imageToMat(image) {
+    function imageToMat(imageObj) {
         const canvas = document.createElement('canvas');
-        canvas.width = image.naturalWidth || image.width;
-        canvas.height = image.naturalHeight || image.height;
+        canvas.width = imageObj.naturalWidth || imageObj.width;
+        canvas.height = imageObj.naturalHeight || imageObj.height;
         const ctx = canvas.getContext('2d');
-        ctx.drawImage(image, 0, 0);
+        ctx.drawImage(imageObj, 0, 0);
         const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         const mat = matFromImageData(imgData);
         window.cv.cvtColor(mat, mat, window.cv.COLOR_RGBA2GRAY, 0);
         return mat;
     }
 
-    /**
-     * Find the transformation matrix between two images using feature matching
-     * Returns a 2x3 affine transformation matrix or null if matching fails
-     */
-    function findImageAlignment(prevImage, currImage) {
+    function findImageAlignment(prevImageObj, currImageObj) {
         try {
-            const matPrev = imageToMat(prevImage);
-            const matCurr = imageToMat(currImage);
+            const matPrev = imageToMat(prevImageObj);
+            const matCurr = imageToMat(currImageObj);
 
-            // Use ORB detector for feature matching
             const orb = new window.cv.ORB(500);
             const kpPrev = new window.cv.KeyPointVector();
             const descPrev = new window.cv.Mat();
@@ -194,12 +216,10 @@ export default function App() {
             orb.detectAndCompute(matPrev, new window.cv.Mat(), kpPrev, descPrev);
             orb.detectAndCompute(matCurr, new window.cv.Mat(), kpCurr, descCurr);
 
-            // Match features
             const bf = new window.cv.BFMatcher(window.cv.NORM_HAMMING, true);
             const matches = new window.cv.DMatchVector();
             bf.match(descPrev, descCurr, matches);
 
-            // Need at least 3 matches for affine transform
             if (matches.size() < 3) {
                 matPrev.delete();
                 matCurr.delete();
@@ -213,7 +233,6 @@ export default function App() {
                 return null;
             }
 
-            // Extract matched points
             const srcPoints = new window.cv.Mat(matches.size(), 1, window.cv.CV_32FC2);
             const dstPoints = new window.cv.Mat(matches.size(), 1, window.cv.CV_32FC2);
 
@@ -227,14 +246,10 @@ export default function App() {
                 dstPoints.data32F[i * 2 + 1] = pt2.pt.y;
             }
 
-            // Estimate affine transform using RANSAC
-            // Try estimateAffine2D first (more general), fallback to getAffineTransform if we have exactly 3 points
             let transform;
             if (matches.size() === 3) {
-                // For exactly 3 points, use getAffineTransform
                 transform = window.cv.getAffineTransform(srcPoints, dstPoints);
             } else {
-                // For more points, use estimateAffine2D with RANSAC
                 const inliers = new window.cv.Mat();
                 try {
                     transform = window.cv.estimateAffine2D(
@@ -249,7 +264,6 @@ export default function App() {
                     );
                     inliers.delete();
                 } catch (e) {
-                    // Fallback: use first 3 points for getAffineTransform
                     const src3 = new window.cv.Mat(3, 1, window.cv.CV_32FC2);
                     const dst3 = new window.cv.Mat(3, 1, window.cv.CV_32FC2);
                     for (let i = 0; i < 3; i++) {
@@ -280,17 +294,13 @@ export default function App() {
             if (!transform || transform.empty()) {
                 return null;
             }
-
             return transform;
         } catch (err) {
-            console.warn("Image alignment failed:", err);
+            console.warn('Image alignment failed:', err);
             return null;
         }
     }
 
-    /**
-     * Apply affine transformation to points
-     */
     function applyTransform(points, transform) {
         if (!transform || points.length === 0) return points;
 
@@ -307,51 +317,43 @@ export default function App() {
         }));
     }
 
-    /**
-     * Fallback: Use template matching to find translation-only alignment
-     * This is more robust for images that are primarily translated
-     */
-    function findTranslationAlignment(prevImage, currImage) {
+    function findTranslationAlignment(prevImageObj, currImageObj) {
         try {
-            const matPrev = imageToMat(prevImage);
-            const matCurr = imageToMat(currImage);
+            const matPrev = imageToMat(prevImageObj);
+            const matCurr = imageToMat(currImageObj);
 
-            // Use a portion of the previous image as a template (center region)
-            const templateSize = Math.min(matPrev.cols, matPrev.rows, matCurr.cols, matCurr.rows) * 0.5;
+            const templateSize =
+                Math.min(matPrev.cols, matPrev.rows, matCurr.cols, matCurr.rows) * 0.5;
             const templateX = Math.floor((matPrev.cols - templateSize) / 2);
             const templateY = Math.floor((matPrev.rows - templateSize) / 2);
 
-            const template = matPrev.roi(new window.cv.Rect(
-                templateX,
-                templateY,
-                Math.floor(templateSize),
-                Math.floor(templateSize)
-            ));
+            const template = matPrev.roi(
+                new window.cv.Rect(
+                    templateX,
+                    templateY,
+                    Math.floor(templateSize),
+                    Math.floor(templateSize)
+                )
+            );
 
-            // Match template in current image
             const result = new window.cv.Mat();
             const mask = new window.cv.Mat();
             window.cv.matchTemplate(matCurr, template, result, window.cv.TM_CCOEFF_NORMED, mask);
 
-            // Find best match
             const minMaxLoc = window.cv.minMaxLoc(result, mask);
             const matchX = minMaxLoc.maxLoc.x;
             const matchY = minMaxLoc.maxLoc.y;
 
-            // Calculate translation
             const shiftX = matchX - templateX;
             const shiftY = matchY - templateY;
 
-            // Create translation-only transform matrix
-            // Matrix format: [a b tx]
-            //                [c d ty]
             const transform = new window.cv.Mat(2, 3, window.cv.CV_64F);
-            transform.set(0, 0, 1, 0); // a = 1
-            transform.set(0, 1, 0, 0); // b = 0
-            transform.set(0, 2, shiftX, 0); // tx
-            transform.set(1, 0, 0, 0); // c = 0
-            transform.set(1, 1, 1, 0); // d = 1
-            transform.set(1, 2, shiftY, 0); // ty
+            transform.set(0, 0, 1, 0);
+            transform.set(0, 1, 0, 0);
+            transform.set(0, 2, shiftX, 0);
+            transform.set(1, 0, 0, 0);
+            transform.set(1, 1, 1, 0);
+            transform.set(1, 2, shiftY, 0);
 
             matPrev.delete();
             matCurr.delete();
@@ -361,31 +363,25 @@ export default function App() {
 
             return transform;
         } catch (err) {
-            console.warn("Translation alignment failed:", err);
+            console.warn('Translation alignment failed:', err);
             return null;
         }
     }
 
-    /**
-     * Transform points from previous image coordinate space to current image coordinate space
-     * Uses image alignment to find the transformation
-     */
-    function transformPointsBetweenImages(points, prevImage, currImage) {
-        if (!points || points.length === 0 || !prevImage || !currImage) {
+    function transformPointsBetweenImages(points, prevImageObj, currImageObj) {
+        if (!points || points.length === 0 || !prevImageObj || !currImageObj) {
             return points;
         }
 
-        // Try feature-based alignment first
-        let transform = findImageAlignment(prevImage, currImage);
+        let transform = findImageAlignment(prevImageObj, currImageObj);
 
-        // Fallback to phase correlation if feature matching fails
         if (!transform) {
-            console.log("Feature matching failed, trying phase correlation...");
-            transform = findTranslationAlignment(prevImage, currImage);
+            console.log('Feature matching failed, trying translation alignment...');
+            transform = findTranslationAlignment(prevImageObj, currImageObj);
         }
 
         if (!transform) {
-            console.warn("Could not find alignment, returning original points");
+            console.warn('Could not find alignment, returning original points');
             return points;
         }
 
@@ -409,30 +405,31 @@ export default function App() {
                     setCurrentIndex(safeIdx);
                 }
             })
-            .catch(err => console.error("Failed to fetch image list:", err));
+            .catch((err) => console.error('Failed to fetch image list:', err));
     }, []);
 
-    // Save current index to localStorage whenever it changes
+    // Save current index
     useEffect(() => {
         if (imageList.length > 0) {
             localStorage.setItem('currentImageIndex', currentIndex.toString());
         }
     }, [currentIndex, imageList.length]);
 
+    // Wait for OpenCV
     useEffect(() => {
         const waitForCV = () => {
             if (window.cv && window.cv.Mat) {
-                console.log("✅ OpenCV.js ready");
+                console.log('✅ OpenCV.js ready');
                 setCvReady(true);
             } else {
-                console.log("⌛ Waiting for OpenCV...");
+                console.log('⌛ Waiting for OpenCV...');
                 setTimeout(waitForCV, 500);
             }
         };
         waitForCV();
     }, []);
 
-    // Calculate stage scale to fit viewport
+    // Stage scale
     useEffect(() => {
         if (!image) {
             setStageScale(1);
@@ -444,48 +441,39 @@ export default function App() {
             const imgWidth = image.naturalWidth || image.width;
             const imgHeight = image.naturalHeight || image.height;
 
-            // Get viewport dimensions (accounting for toolbar and padding)
-            const maxWidth = window.innerWidth - 100; // Leave some margin
-            const maxHeight = window.innerHeight - 200; // Account for toolbar and padding
+            const maxWidth = window.innerWidth - 100;
+            const maxHeight = window.innerHeight - 200;
 
-            // Calculate scale to fit within viewport while maintaining aspect ratio
             const scaleX = maxWidth / imgWidth;
             const scaleY = maxHeight / imgHeight;
-            const scale = Math.min(scaleX, scaleY, 1); // Don't scale up, only down
+            const scale = Math.min(scaleX, scaleY, 1);
 
-            // Use full image dimensions for the Stage (it will be scaled)
             setStageDimensions({width: imgWidth, height: imgHeight});
             setStageScale(scale);
         };
 
         calculateStageScale();
-
-        // Recalculate on window resize
-        const handleResize = () => {
-            calculateStageScale();
-        };
+        const handleResize = () => calculateStageScale();
         window.addEventListener('resize', handleResize);
         return () => window.removeEventListener('resize', handleResize);
     }, [image]);
 
-
+    // Transform annotations between images
     useEffect(() => {
         if (!image) return;
         if (!prevImageName || !prevImage) {
-            // First load, no previous image
             setPrevImageName(currentImageName);
             if (image) setPrevImage(image);
             return;
         }
 
         if (!cvReady) {
-            console.warn("Skipping alignment — OpenCV not ready yet");
+            console.warn('Skipping alignment — OpenCV not ready yet');
             setPrevImageName(currentImageName);
             if (image) setPrevImage(image);
             return;
         }
 
-        // Transform annotations using image alignment
         const mapPoints = (pts) => {
             if (!pts || pts.length === 0) return pts;
             return transformPointsBetweenImages(pts, prevImage, image);
@@ -514,22 +502,18 @@ export default function App() {
                 floorEdges: [...floorEdges],
             },
         ];
-        setHistoryVersion((v) => v + 1);
         setDidScaleForImage(false);
     }, [didScaleForImage, image]);
 
     function deletePoint(points, edges, pointIndex) {
-        // 1. Remove edges containing this point
         const remainingEdges = edges.filter(([a, b]) => a !== pointIndex && b !== pointIndex);
 
-        // 2. Same cleanup as deleteEdge
         const used = new Set();
         remainingEdges.forEach(([a, b]) => {
             used.add(a);
             used.add(b);
         });
 
-        // 3. Filter + remap
         const newPoints = [];
         const remap = {};
 
@@ -540,27 +524,20 @@ export default function App() {
             }
         });
 
-        // 4. Remap edges
-        const newEdges = remainingEdges.map(([a, b]) => [
-            remap[a],
-            remap[b]
-        ]);
+        const newEdges = remainingEdges.map(([a, b]) => [remap[a], remap[b]]);
 
         return {newPoints, newEdges};
     }
 
     function deleteEdge(points, edges, edgeIndex) {
-        // 1. Remove selected edge
         const remainingEdges = edges.filter((_, idx) => idx !== edgeIndex);
 
-        // 2. Find all point indices still used
         const used = new Set();
         remainingEdges.forEach(([a, b]) => {
             used.add(a);
             used.add(b);
         });
 
-        // 3. Filter points and build index remap
         const newPoints = [];
         const remap = {};
         points.forEach((pt, i) => {
@@ -570,12 +547,7 @@ export default function App() {
             }
         });
 
-        // 4. Remap edges
-        const newEdges = remainingEdges.map(([a, b]) => [
-            remap[a],
-            remap[b]
-        ]);
-
+        const newEdges = remainingEdges.map(([a, b]) => [remap[a], remap[b]]);
         return {newPoints, newEdges};
     }
 
@@ -583,13 +555,14 @@ export default function App() {
     // Handle drawing click
     // ==================
     const handleClick = (e) => {
-        e.evt.preventDefault(); // prevent right-click menu
+        if (loadMode && choicePending) {
+            return;
+        }
+
+        e.evt.preventDefault();
         const stage = e.target.getStage();
         let point = stage.getPointerPosition();
 
-        // Convert from scaled Stage coordinates to original image coordinates
-        // When Stage is scaled, getPointerPosition returns coordinates in Stage space
-        // We need to account for the scale to get coordinates in the original image space
         if (point && stageScale !== 1) {
             point = {
                 x: point.x / stageScale,
@@ -597,83 +570,57 @@ export default function App() {
             };
         }
 
-        // Ensure point is valid
         if (!point) return;
 
         const isRightClick = e.evt.button === 2;
         const isCtrlClick = e.evt.ctrlKey || e.evt.metaKey;
 
-        // ==========================
-        // Ctrl+Click → Delete point/node
-        // ==========================
         if (isCtrlClick && hoverTarget?.type === 'point') {
-            e.evt.stopPropagation(); // Prevent any other handlers
-            pushHistory(); // for undo
+            e.evt.stopPropagation();
+            pushHistory();
             const {mode, index} = hoverTarget;
 
-            // Read current state and calculate updates, then apply both
             if (mode === 'outer') {
-                const currentPoints = outerWallPoints;
-                const currentEdges = outerWallEdges;
-                const {newPoints, newEdges} = deletePoint(currentPoints, currentEdges, index);
+                const {newPoints, newEdges} = deletePoint(outerWallPoints, outerWallEdges, index);
                 setOuterWallPoints(newPoints);
                 setOuterWallEdges(newEdges);
             } else if (mode === 'inner') {
-                const currentPoints = innerWallPoints;
-                const currentEdges = innerWallEdges;
-                const {newPoints, newEdges} = deletePoint(currentPoints, currentEdges, index);
+                const {newPoints, newEdges} = deletePoint(innerWallPoints, innerWallEdges, index);
                 setInnerWallPoints(newPoints);
                 setInnerWallEdges(newEdges);
             } else {
-                const currentPoints = floorPoints;
-                const currentEdges = floorEdges;
-                const {newPoints, newEdges} = deletePoint(currentPoints, currentEdges, index);
+                const {newPoints, newEdges} = deletePoint(floorPoints, floorEdges, index);
                 setFloorPoints(newPoints);
                 setFloorEdges(newEdges);
             }
 
-            setHasUnsavedChanges(true);
             setHasExported(false);
-            return; // ✅ stop here – don't add new points
+            return;
         }
 
-        // ==========================
-        // Ctrl+Click → Delete edge
-        // ==========================
         if (isCtrlClick && hoverTarget?.type === 'edge') {
-            e.evt.stopPropagation(); // Prevent any other handlers
-            pushHistory(); // for undo
+            e.evt.stopPropagation();
+            pushHistory();
             const {mode, index} = hoverTarget;
 
-            // Read current state and calculate updates, then apply both
             if (mode === 'outer') {
-                const currentPoints = outerWallPoints;
-                const currentEdges = outerWallEdges;
-                const {newPoints, newEdges} = deleteEdge(currentPoints, currentEdges, index);
+                const {newPoints, newEdges} = deleteEdge(outerWallPoints, outerWallEdges, index);
                 setOuterWallPoints(newPoints);
                 setOuterWallEdges(newEdges);
             } else if (mode === 'inner') {
-                const currentPoints = innerWallPoints;
-                const currentEdges = innerWallEdges;
-                const {newPoints, newEdges} = deleteEdge(currentPoints, currentEdges, index);
+                const {newPoints, newEdges} = deleteEdge(innerWallPoints, innerWallEdges, index);
                 setInnerWallPoints(newPoints);
                 setInnerWallEdges(newEdges);
             } else {
-                const currentPoints = floorPoints;
-                const currentEdges = floorEdges;
-                const {newPoints, newEdges} = deleteEdge(currentPoints, currentEdges, index);
+                const {newPoints, newEdges} = deleteEdge(floorPoints, floorEdges, index);
                 setFloorPoints(newPoints);
                 setFloorEdges(newEdges);
             }
 
-            setHasUnsavedChanges(true);
             setHasExported(false);
-            return; // ✅ stop here – don't add new points
+            return;
         }
 
-        // ==========================
-        // Normal drawing behavior
-        // ==========================
         if (hoverTarget) {
             if (hoverTarget.type === 'point') {
                 point = hoverTarget.data;
@@ -711,35 +658,33 @@ export default function App() {
             setFloorEdges(newEdges);
         }
 
-        setHasUnsavedChanges(true);
         setHasExported(false);
     };
 
     // ==================
-    // Export JSON (no popup)
+    // Export JSON
     // ==================
     const exportData = async () => {
         if (!image) {
-            alert("❌ No image loaded — cannot export yet.");
+            alert('❌ No image loaded — cannot export yet.');
             return;
         }
 
-        // Extract the actual source dimensions of the current image
         const imgWidth = image.naturalWidth || image.width;
         const imgHeight = image.naturalHeight || image.height;
 
         const output = {
             image_name: currentImageName,
-            size: {width: imgWidth, height: imgHeight}, // ✅ new field
+            size: {width: imgWidth, height: imgHeight},
             outer_walls: {points: outerWallPoints, edges: outerWallEdges},
             inner_walls: {points: innerWallPoints, edges: innerWallEdges},
             floor: {points: floorPoints, edges: floorEdges},
         };
 
         try {
-            const res = await fetch("http://localhost:3001/api/save-json", {
-                method: "POST",
-                headers: {"Content-Type": "application/json"},
+            const res = await fetch('http://localhost:3001/api/save-json', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
                     imageName: currentImageName,
                     data: output
@@ -749,12 +694,10 @@ export default function App() {
             if (!res.ok) throw new Error(await res.text());
             const result = await res.json();
             console.log(`✅ Saved ${result.path}`);
-
-            setHasUnsavedChanges(false);
             setHasExported(true);
         } catch (err) {
-            console.error("❌ Error saving JSON:", err);
-            alert("Failed to save JSON file.");
+            console.error('❌ Error saving JSON:', err);
+            alert('Failed to save JSON file.');
         }
     };
 
@@ -764,15 +707,19 @@ export default function App() {
     const goToImage = async (delta) => {
         const newIndex = currentIndex + delta;
         if (newIndex < 0 || newIndex >= imageList.length) {
-            window.alert("No more images in this direction.");
+            window.alert('No more images in this direction.');
             return;
         }
 
-        // Warn if there are unsaved changes, but allow navigation
-        if (!hasExported && (outerWallPoints.length > 0 || innerWallPoints.length > 0 || floorPoints.length > 0)) {
-            const confirmed = window.confirm("⚠️ You have unsaved annotations. Are you sure you want to continue without saving?");
+        if (
+            !hasExported &&
+            (outerWallPoints.length > 0 || innerWallPoints.length > 0 || floorPoints.length > 0)
+        ) {
+            const confirmed = window.confirm(
+                '⚠️ You have unsaved annotations. Are you sure you want to continue without saving?'
+            );
             if (!confirmed) {
-                return; // User cancelled, stay on current image
+                return;
             }
         }
 
@@ -780,14 +727,14 @@ export default function App() {
         setPrevImageName(currentImageName);
         setDidScaleForImage(false);
         setCurrentIndex(newIndex);
-        setHasUnsavedChanges(false);
         setHasExported(false);
+        setPreviewedImage(null);
+        setChoicePending(false);
     };
 
-
-// ==================
-// Undo (Ctrl+Z) – fixed to always stay in sync
-// ==================
+    // ==================
+    // Undo (Ctrl+Z)
+    // ==================
     useEffect(() => {
         const handleKeyDown = (e) => {
             if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'z') {
@@ -804,70 +751,211 @@ export default function App() {
                 setInnerWallEdges([...last.innerWallEdges]);
                 setFloorPoints([...last.floorPoints]);
                 setFloorEdges([...last.floorEdges]);
-                setHasUnsavedChanges(true);
                 setHasExported(false);
-                setHistoryVersion(v => v + 1);
             }
         };
 
-        // Attach only once
         window.addEventListener('keydown', handleKeyDown, true);
         return () => window.removeEventListener('keydown', handleKeyDown, true);
-    }, []); // <- no dependencies
+    }, []);
+
+    // ==================
+    // Load Mode: Dual Preview Logic
+    // ==================
+    useEffect(() => {
+        if (!image || !loadMode) {
+            setChoicePending(false);
+            setPreviewedImage(null);
+            return;
+        }
+
+        if (previewedImage === currentImageName && !choicePending) {
+            return;
+        }
+
+        const snapshot = getCurrentSnapshot();
+        setTransformedPreview(snapshot);
+        setLoadingJson(true);
+        setJsonError(null);
+
+        fetch(`http://localhost:3001/api/json/${currentImageName}`)
+            .then((res) => res.json())
+            .then((payload) => {
+                if (payload.exists && payload.data) {
+                    const d = payload.data;
+                    setLoadedPreview({
+                        outer: d.outer_walls || {points: [], edges: []},
+                        inner: d.inner_walls || {points: [], edges: []},
+                        floor: d.floor || {points: [], edges: []},
+                    });
+                } else {
+                    setLoadedPreview(null);
+                }
+            })
+            .catch((err) => {
+                console.error('Error loading JSON:', err);
+                setJsonError(String(err));
+                setLoadedPreview(null);
+            })
+            .finally(() => {
+                setLoadingJson(false);
+                setChoicePending(true);
+                setPreviewedImage(currentImageName);
+            });
+    }, [image, loadMode, currentImageName]);
+
+    const handleChooseTransformed = () => {
+        pushHistory();
+        applySnapshot(transformedPreview || emptyAnn);
+        setChoicePending(false);
+    };
+
+    const handleChooseLoaded = () => {
+        pushHistory();
+        applySnapshot(loadedPreview || emptyAnn);
+        setChoicePending(false);
+    };
 
     // ==================
     // Rendering
     // ==================
+    const currentFileLabel = currentImageName || '(no image)';
+
+    const renderAnnotations = (ann, hover, modeLabel) => {
+        const outer = ann.outer || {points: [], edges: []};
+        const inner = ann.inner || {points: [], edges: []};
+        const floor = ann.floor || {points: [], edges: []};
+
+        return (
+            <>
+                {/* Outer */}
+                {outer.edges.map(([i1, i2], idx) => (
+                    <Line
+                        key={`${modeLabel}-outer-${idx}`}
+                        points={[
+                            outer.points[i1].x,
+                            outer.points[i1].y,
+                            outer.points[i2].x,
+                            outer.points[i2].y,
+                        ]}
+                        stroke="red"
+                        strokeWidth={
+                            hover?.type === 'edge' && hover?.mode === 'outer' && hover?.index === idx ? 3 : 2
+                        }
+                    />
+                ))}
+                {outer.points.map((pt, idx) => (
+                    <Circle
+                        key={`${modeLabel}-opt-${idx}`}
+                        x={pt.x}
+                        y={pt.y}
+                        radius={
+                            hover?.type === 'point' && hover?.mode === 'outer' && hover?.index === idx ? 6 : 4
+                        }
+                        fill="red"
+                    />
+                ))}
+
+                {/* Inner */}
+                {inner.edges.map(([i1, i2], idx) => (
+                    <Line
+                        key={`${modeLabel}-inner-${idx}`}
+                        points={[
+                            inner.points[i1].x,
+                            inner.points[i1].y,
+                            inner.points[i2].x,
+                            inner.points[i2].y,
+                        ]}
+                        stroke="orange"
+                        strokeWidth={
+                            hover?.type === 'edge' && hover?.mode === 'inner' && hover?.index === idx ? 3 : 2
+                        }
+                    />
+                ))}
+                {inner.points.map((pt, idx) => (
+                    <Circle
+                        key={`${modeLabel}-ipt-${idx}`}
+                        x={pt.x}
+                        y={pt.y}
+                        radius={
+                            hover?.type === 'point' && hover?.mode === 'inner' && hover?.index === idx ? 6 : 4
+                        }
+                        fill="orange"
+                    />
+                ))}
+
+                {/* Floor */}
+                {floor.edges.map(([i1, i2], idx) => (
+                    <Line
+                        key={`${modeLabel}-floor-${idx}`}
+                        points={[
+                            floor.points[i1].x,
+                            floor.points[i1].y,
+                            floor.points[i2].x,
+                            floor.points[i2].y,
+                        ]}
+                        stroke="green"
+                        strokeWidth={
+                            hover?.type === 'edge' && hover?.mode === 'floor' && hover?.index === idx ? 3 : 2
+                        }
+                    />
+                ))}
+                {floor.points.map((pt, idx) => (
+                    <Circle
+                        key={`${modeLabel}-fpt-${idx}`}
+                        x={pt.x}
+                        y={pt.y}
+                        radius={
+                            hover?.type === 'point' && hover?.mode === 'floor' && hover?.index === idx ? 6 : 4
+                        }
+                        fill="green"
+                    />
+                ))}
+            </>
+        );
+    };
+
     return (
         <div className="p-4 space-y-4">
             {/* === Toolbar === */}
-            <div className="flex gap-4 items-center">
-                {/* Mode toggle cycles through 3 types */}
+            <div className="flex gap-4 items-center" style={{marginBottom: 12}}>
                 <Button
                     onClick={() => {
-                        const next = annotationMode === 'outer'
-                            ? 'inner'
-                            : annotationMode === 'inner'
-                                ? 'floor'
-                                : 'outer';
+                        const next =
+                            annotationMode === 'outer'
+                                ? 'inner'
+                                : annotationMode === 'inner'
+                                    ? 'floor'
+                                    : 'outer';
                         setAnnotationMode(next);
                     }}
-                    color={
-                        annotationMode === 'outer'
-                            ? 'red'
-                            : annotationMode === 'inner'
-                                ? 'orange'
-                                : 'green'
-                    }
+                    color={annotationMode === 'outer' ? 'red' : annotationMode === 'inner' ? 'orange' : 'green'}
+                    inactive={loadMode && choicePending}
                 >
-                    Mode: {annotationMode === 'outer'
-                    ? 'Outer Walls'
-                    : annotationMode === 'inner'
-                        ? 'Inner Walls'
-                        : 'Floor'}
+                    Mode:{' '}
+                    {annotationMode === 'outer'
+                        ? 'Outer Walls'
+                        : annotationMode === 'inner'
+                            ? 'Inner Walls'
+                            : 'Floor'}
                 </Button>
 
-                <Button onClick={exportData} color="green">
+                <Button onClick={exportData} color="green" inactive={loadMode && choicePending}>
                     Save
                 </Button>
 
                 <Button
                     onClick={() => {
-                        // BEFORE clearing → save current state
                         pushHistory();
-
                         setOuterWallPoints([]);
                         setOuterWallEdges([]);
                         setInnerWallPoints([]);
                         setInnerWallEdges([]);
                         setFloorPoints([]);
                         setFloorEdges([]);
-
-                        setHasUnsavedChanges(false);
                         setHasExported(false);
-
-                        // DO NOT reset historyRef here — let undo work
                     }}
+                    inactive={loadMode && choicePending}
                 >
                     Clear
                 </Button>
@@ -884,7 +972,24 @@ export default function App() {
                     Reset Progress
                 </Button>
 
-                <span style={{fontWeight: 'bold', color: hasExported ? 'green' : 'red'}}>
+                <label style={{marginLeft: 16}}>
+                    <input
+                        type="checkbox"
+                        checked={loadMode}
+                        onChange={(e) => {
+                            const val = e.target.checked;
+                            setLoadMode(val);
+                            if (!val) {
+                                setChoicePending(false);
+                                setPreviewedImage(null);
+                            }
+                        }}
+                        style={{marginRight: 4}}
+                    />
+                    Load mode
+                </label>
+
+                <span style={{fontWeight: 'bold', color: hasExported ? 'green' : 'red', marginLeft: 16}}>
           {hasExported ? 'Saved' : 'Not Saved'}
         </span>
 
@@ -892,127 +997,220 @@ export default function App() {
           Left-click = connect, Right-click = free node
         </span>
 
-                <span>{currentImageName}</span>
+                <span style={{marginLeft: 10}}>{currentFileLabel}</span>
             </div>
 
-            {/* === Canvas === */}
-            <div
-                className="border border-gray-300 inline-block"
-                style={{
-                    overflow: 'auto',
-                    maxWidth: '100vw',
-                    maxHeight: '90vh',
-                    display: 'flex',
-                    justifyContent: 'center',
-                    alignItems: 'flex-start'
-                }}
-            >
-                {image ? (
-                    <Stage
-                        width={stageDimensions.width}
-                        height={stageDimensions.height}
-                        scaleX={stageScale}
-                        scaleY={stageScale}
-                        onClick={handleClick}
-                        onMouseMove={handleMouseMove}
-                        onContextMenu={(e) => e.evt.preventDefault()}
-                        ref={stageRef}
+            {loadMode && choicePending && image ? (
+                <div>
+                    {loadingJson && <p style={{padding: 10}}>Loading JSON…</p>}
+                    {jsonError && <p style={{padding: 10, color: 'red'}}>Error: {jsonError}</p>}
+                    <div
+                        style={{
+                            display: 'flex',
+                            gap: '16px',
+                            alignItems: 'flex-start',
+                            justifyContent: 'center',
+                        }}
                     >
-                        <Layer>
-                            <KonvaImage
-                                image={image}
-                                width={image.naturalWidth || image.width}
-                                height={image.naturalHeight || image.height}
-                            />
-                            {/* Outer Walls (red) */}
-                            {outerWallEdges.map(([i1, i2], idx) => (
-                                <Line
-                                    key={`outer-${idx}`}
-                                    points={[
-                                        outerWallPoints[i1].x, outerWallPoints[i1].y,
-                                        outerWallPoints[i2].x, outerWallPoints[i2].y
-                                    ]}
-                                    stroke="red"
-                                    strokeWidth={
-                                        hoverTarget?.type === 'edge' &&
-                                        hoverTarget?.mode === 'outer' &&
-                                        hoverTarget?.index === idx
-                                            ? 3
-                                            : 2
-                                    }
-                                />
-                            ))}
-                            {outerWallPoints.map((pt, idx) => (
-                                <Circle key={`opt-${idx}`} x={pt.x} y={pt.y} radius={
-                                    hoverTarget?.type === 'point' &&
-                                    hoverTarget?.mode === 'outer' &&
-                                    hoverTarget?.index === idx
-                                        ? 6
-                                        : 4
-                                } fill="red"/>
-                            ))}
+                        {/* Left: Transformed preview */}
+                        <div>
+                            <div style={{marginBottom: 4, textAlign: 'center', fontWeight: 'bold'}}>
+                                Carry-over (transformed)
+                            </div>
+                            <Stage
+                                width={stageDimensions.width}
+                                height={stageDimensions.height}
+                                scaleX={stageScale}
+                                scaleY={stageScale}
+                            >
+                                <Layer>
+                                    <KonvaImage
+                                        image={image}
+                                        width={image.naturalWidth || image.width}
+                                        height={image.naturalHeight || image.height}
+                                    />
+                                    {renderAnnotations(transformedPreview || emptyAnn, null, 'left')}
+                                </Layer>
+                            </Stage>
+                            <div style={{textAlign: 'center', marginTop: 8}}>
+                                <Button onClick={handleChooseTransformed} color="blue">
+                                    Choose this
+                                </Button>
+                            </div>
+                        </div>
 
-                            {/* Inner Walls (orange) */}
-                            {innerWallEdges.map(([i1, i2], idx) => (
-                                <Line
-                                    key={`inner-${idx}`}
-                                    points={[
-                                        innerWallPoints[i1].x, innerWallPoints[i1].y,
-                                        innerWallPoints[i2].x, innerWallPoints[i2].y
-                                    ]}
-                                    stroke="orange"
-                                    strokeWidth={
-                                        hoverTarget?.type === 'edge' &&
-                                        hoverTarget?.mode === 'inner' &&
-                                        hoverTarget?.index === idx
-                                            ? 3
-                                            : 2
-                                    }
+                        {/* Right: Loaded JSON preview */}
+                        <div>
+                            <div style={{marginBottom: 4, textAlign: 'center', fontWeight: 'bold'}}>
+                                Loaded from JSON
+                            </div>
+                            <Stage
+                                width={stageDimensions.width}
+                                height={stageDimensions.height}
+                                scaleX={stageScale}
+                                scaleY={stageScale}
+                            >
+                                <Layer>
+                                    <KonvaImage
+                                        image={image}
+                                        width={image.naturalWidth || image.width}
+                                        height={image.naturalHeight || image.height}
+                                    />
+                                    {renderAnnotations(loadedPreview || emptyAnn, null, 'right')}
+                                </Layer>
+                            </Stage>
+                            <div style={{textAlign: 'center', marginTop: 8}}>
+                                <Button onClick={handleChooseLoaded} color="green">
+                                    Choose this
+                                </Button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            ) : (
+                <div
+                    className="border border-gray-300 inline-block"
+                    style={{
+                        overflow: 'auto',
+                        maxWidth: '100vw',
+                        maxHeight: '90vh',
+                        display: 'flex',
+                        justifyContent: 'center',
+                        alignItems: 'flex-start',
+                    }}
+                >
+                    {image ? (
+                        <Stage
+                            width={stageDimensions.width}
+                            height={stageDimensions.height}
+                            scaleX={stageScale}
+                            scaleY={stageScale}
+                            onClick={handleClick}
+                            onMouseMove={handleMouseMove}
+                            onContextMenu={(e) => e.evt.preventDefault()}
+                            ref={stageRef}
+                        >
+                            <Layer>
+                                <KonvaImage
+                                    image={image}
+                                    width={image.naturalWidth || image.width}
+                                    height={image.naturalHeight || image.height}
                                 />
-                            ))}
-                            {innerWallPoints.map((pt, idx) => (
-                                <Circle key={`ipt-${idx}`} x={pt.x} y={pt.y} radius={
-                                    hoverTarget?.type === 'point' &&
-                                    hoverTarget?.mode === 'inner' &&
-                                    hoverTarget?.index === idx
-                                        ? 6
-                                        : 4
-                                } fill="orange"/>
-                            ))}
 
-                            {/* Floor (green) */}
-                            {floorEdges.map(([i1, i2], idx) => (
-                                <Line
-                                    key={`floor-${idx}`}
-                                    points={[
-                                        floorPoints[i1].x, floorPoints[i1].y,
-                                        floorPoints[i2].x, floorPoints[i2].y
-                                    ]}
-                                    stroke="green"
-                                    strokeWidth={
-                                        hoverTarget?.type === 'edge' &&
-                                        hoverTarget?.mode === 'floor' &&
-                                        hoverTarget?.index === idx
-                                            ? 3
-                                            : 2
-                                    }
-                                />
-                            ))}
-                            {floorPoints.map((pt, idx) => (
-                                <Circle key={`fpt-${idx}`} x={pt.x} y={pt.y} radius={
-                                    hoverTarget?.type === 'point' &&
-                                    hoverTarget?.mode === 'floor' &&
-                                    hoverTarget?.index === idx
-                                        ? 6
-                                        : 4
-                                } fill="green"/>
-                            ))}
-                        </Layer>
-                    </Stage>
-                ) : (
-                    <p style={{padding: 10}}>Loading image...</p>
-                )}
-            </div>
+                                {/* Outer Walls (red) */}
+                                {outerWallEdges.map(([i1, i2], idx) => (
+                                    <Line
+                                        key={`outer-${idx}`}
+                                        points={[
+                                            outerWallPoints[i1].x,
+                                            outerWallPoints[i1].y,
+                                            outerWallPoints[i2].x,
+                                            outerWallPoints[i2].y,
+                                        ]}
+                                        stroke="red"
+                                        strokeWidth={
+                                            hoverTarget?.type === 'edge' &&
+                                            hoverTarget?.mode === 'outer' &&
+                                            hoverTarget?.index === idx
+                                                ? 3
+                                                : 2
+                                        }
+                                    />
+                                ))}
+                                {outerWallPoints.map((pt, idx) => (
+                                    <Circle
+                                        key={`opt-${idx}`}
+                                        x={pt.x}
+                                        y={pt.y}
+                                        radius={
+                                            hoverTarget?.type === 'point' &&
+                                            hoverTarget?.mode === 'outer' &&
+                                            hoverTarget?.index === idx
+                                                ? 6
+                                                : 4
+                                        }
+                                        fill="red"
+                                    />
+                                ))}
+
+                                {/* Inner Walls (orange) */}
+                                {innerWallEdges.map(([i1, i2], idx) => (
+                                    <Line
+                                        key={`inner-${idx}`}
+                                        points={[
+                                            innerWallPoints[i1].x,
+                                            innerWallPoints[i1].y,
+                                            innerWallPoints[i2].x,
+                                            innerWallPoints[i2].y,
+                                        ]}
+                                        stroke="orange"
+                                        strokeWidth={
+                                            hoverTarget?.type === 'edge' &&
+                                            hoverTarget?.mode === 'inner' &&
+                                            hoverTarget?.index === idx
+                                                ? 3
+                                                : 2
+                                        }
+                                    />
+                                ))}
+                                {innerWallPoints.map((pt, idx) => (
+                                    <Circle
+                                        key={`ipt-${idx}`}
+                                        x={pt.x}
+                                        y={pt.y}
+                                        radius={
+                                            hoverTarget?.type === 'point' &&
+                                            hoverTarget?.mode === 'inner' &&
+                                            hoverTarget?.index === idx
+                                                ? 6
+                                                : 4
+                                        }
+                                        fill="orange"
+                                    />
+                                ))}
+
+                                {/* Floor (green) */}
+                                {floorEdges.map(([i1, i2], idx) => (
+                                    <Line
+                                        key={`floor-${idx}`}
+                                        points={[
+                                            floorPoints[i1].x,
+                                            floorPoints[i1].y,
+                                            floorPoints[i2].x,
+                                            floorPoints[i2].y,
+                                        ]}
+                                        stroke="green"
+                                        strokeWidth={
+                                            hoverTarget?.type === 'edge' &&
+                                            hoverTarget?.mode === 'floor' &&
+                                            hoverTarget?.index === idx
+                                                ? 3
+                                                : 2
+                                        }
+                                    />
+                                ))}
+                                {floorPoints.map((pt, idx) => (
+                                    <Circle
+                                        key={`fpt-${idx}`}
+                                        x={pt.x}
+                                        y={pt.y}
+                                        radius={
+                                            hoverTarget?.type === 'point' &&
+                                            hoverTarget?.mode === 'floor' &&
+                                            hoverTarget?.index === idx
+                                                ? 6
+                                                : 4
+                                        }
+                                        fill="green"
+                                    />
+                                ))}
+                            </Layer>
+                        </Stage>
+                    ) : (
+                        <p style={{padding: 10}}>Loading image...</p>
+                    )}
+                </div>
+            )}
         </div>
     );
 }
